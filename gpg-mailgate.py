@@ -78,34 +78,10 @@ def gpg_encrypt( raw_message, recipients ):
 
 	for to in recipients:
 
-		# Check if recipient is in keymap
-		if get_bool_from_cfg('enc_keymap', to):
-			log("Encrypt keymap has key '%s'" % cfg['enc_keymap'][to] )
-			# Check we've got a matching key!
-			if cfg['enc_keymap'][to] in keys:
-				gpg_to.append( (to, cfg['enc_keymap'][to]) )
-				continue
-			else:
-				log("Key '%s' in encrypt keymap not found in keyring for email address '%s'." % (cfg['enc_keymap'][to], to))
-
 		# Check if key in keychain is present
-		if to in keys.values() and not get_bool_from_cfg('default', 'enc_keymap_only', 'yes'):
+		if to in keys.values():
 			gpg_to.append( (to, to) )
 			continue
-
-		# Check if there is a default key for the domain
-		splitted_to = to.split('@')
-		if len(splitted_to) > 1:
-			domain = splitted_to[1]
-			if get_bool_from_cfg('enc_domain_keymap', domain):
-				log("Encrypt domain keymap has key '%s'" % cfg['enc_dec_keymap'][domain] )
-				# Check we've got a matching key!
-				if cfg['enc_domain_keymap'][domain] in keys:
-					log("Using default domain key for recipient '%s'" % to)
-					gpg_to.append( (to, cfg['enc_domain_keymap'][domain]) )
-					continue
-				else:
-					log("Key '%s' in encrypt domain keymap not found in keyring for email address '%s'." % (cfg['enc_domain_keymap'][domain], to))
 
 		# At this point no key has been found
 		if verbose:
