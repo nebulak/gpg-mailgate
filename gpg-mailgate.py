@@ -44,6 +44,7 @@ for sect in _cfg.sections():
 	for (name, value) in _cfg.items(sect):
 		cfg[sect][name] = value
 
+
 def log( msg ):
 	if 'logging' in cfg and 'file' in cfg['logging']:
 		if cfg['logging'].get('file') == "syslog":
@@ -61,226 +62,6 @@ raw_message = email.message_from_string( raw )
 from_addr = raw_message['From']
 to_addrs = sys.argv[1:]
 
-def gpg_decrypt( raw_message, recipients ):
-
-	gpg_to = list()
-	ungpg_to = list()
-
-	# This is needed to avoid encryption if decryption is set to keymap only,
-	# private key is present but not in keymap.
-	noenc_to = list()
-
-	if not get_bool_from_cfg('gpg', 'keyhome'):
-		log("No valid entry for gpg keyhome. Decryption aborted.")
-		return recipients
-
-	keys = GnuPG.private_keys( cfg['gpg']['keyhome'] )
-
-	if get_bool_from_cfg('default', 'dec_regex'):
-		dec_regex = cfg['default']['dec_regex']
-	else:
-		dec_regex = None
-
-	for fingerprint in keys:
-		keys[fingerprint] = sanitize_case_sense(keys[fingerprint])
-
-	for to in recipients:
-		if to in keys.values() and not get_bool_from_cfg('default', 'dec_keymap_only', 'yes'):
-			gpg_to.append(to)
-		# Is this recipient defined in regex for default decryption?
-		elif not (dec_regex is None) and not (re.match(dec_regex, to) is None):
-			log("Using default decrytion defined in dec_regex for recipient '%s'" % to)
-			gpg_to.append(to)
-		elif get_bool_from_cfg('dec_keymap', to):
-			log("Decrypt keymap has key '%s'" % cfg['dec_keymap'][to] )
-			# Check we've got a matching key! If not, decline to attempt decryption. The key is checked for safty reasons.
-			if not cfg['dec_keymap'][to] in keys:
-				log("Key '%s' in decryption keymap not found in keyring for email address '%s'. Won't decrypt." % (cfg['dec_keymap'][to], to))
-				# Avoid unwanted encryption if set
-				if to in keys.values() and get_bool_from_cfg('default', 'failsave_dec', 'yes'):
-					noenc_to.append(to)
-				else:
-					ungpg_to.append(to)
-			else:
-				gpg_to.append(to)
-		else:
-			if verbose:
-				log("Recipient (%s) not in PGP domain list for decrypting." % to)
-			# Avoid unwanted encryption if set
-			if to in keys.values() and get_bool_from_cfg('default', 'failsave_dec', 'yes'):
-				noenc_to.append(to)
-			else:
-				ungpg_to.append(to)
-
-	if gpg_to != list():
-		send_msg( gpg_decrypt_all_payloads( raw_message ).as_string(), gpg_to )
-
-	if noenc_to != list():
-		log("Do not try to encrypt mails for: %s" % ', '.join( noenc_to ))
-		send_msg(raw_message.as_string(), noenc_to)
-
-	return ungpg_to
-
-def gpg_decrypt_all_payloads( message ):
-
-	# We don't want to modify the original message
-	decrypted_message = copy.deepcopy(message)
-
-	# Check if message is PGP/MIME encrypted
-	if not (message.get_param('protocol') is None) and message.get_param('protocol') == 'application/pgp-encrypted' and message.is_multipart():
-		decrypted_message = decrypt_mime(decrypted_message)
-
-	# At this point the message could only be PGP/INLINE encrypted, unencrypted or
-	# encrypted with a mechanism not covered by GPG-Mailgate
-	elif get_bool_from_cfg('default', 'no_inline_dec', 'no'):
-		# Check if message is PGP/INLINE encrypted and has attachments (or unencrypted with attachments)
-		if message.is_multipart():
-
-			# Set message's payload to list so payloads can be attached later on
-			decrypted_message.set_payload(list())
-
-			# We only need to hand over the original message here. Not needed for other decrypt implementations.
-			decrypted_message, success = decrypt_inline_with_attachments(message, False, decrypted_message)
-
-			# Add header here to avoid it being appended several times
-			if get_bool_from_cfg('default', 'add_header', 'yes') and success:
-				decrypted_message['X-GPG-Mailgate'] = 'Decrypted by GPG Mailgate'
-
-		# Check if message is PGP/INLINE encrypted without attachments (or unencrypted without attachments)
-		else:
-			decrypted_message = decrypt_inline_without_attachments(decrypted_message)
-
-	return decrypted_message
-
-def decrypt_mime( decrypted_message ):
-	# Please note: Signatures will disappear while decrypting and will not be checked
-
-	# Getting the part which should be PGP encrypted (according to RFC)
-	msg_content = decrypted_message.get_payload(1).get_payload()
-
-	if "-----BEGIN PGP MESSAGE-----" in msg_content and "-----END PGP MESSAGE-----" in msg_content:
-		start = msg_content.find("-----BEGIN PGP MESSAGE-----")
-		end = msg_content.find("-----END PGP MESSAGE-----")
-		decrypted_payload, decrypt_success = decrypt_payload(msg_content[start:end + 25])
-
-		if decrypt_success:
-			# Making decrypted_message a "normal" unencrypted message
-			decrypted_message.del_param('protocol')
-			decrypted_message.set_type(decrypted_payload.get_content_type())
-
-			# Restore Content-Disposition header from original message
-			if not (decrypted_payload.get('Content-Disposition') is None):
-				if not (decrypted_message.get('Content-Disposition') is None):
-					decrypted_message.replace_header('Content-Disposition', decrypted_payload.get('Content-Disposition'))
-				else:
-					decrypted_message.set_param(decrypted_payload.get('Content-Disposition'), "", 'Content-Disposition')
-
-			if decrypted_payload.is_multipart():
-				# Clear message's original payload and insert the decrypted payloads
-				decrypted_message.set_payload(list())
-				decrypted_message = generate_message_from_payloads( decrypted_payload, decrypted_message )
-				decrypted_message.preamble = "This is a multi-part message in MIME format"
-			else:
-				decrypted_message.set_payload(decrypted_payload.get_payload())
-				decrypted_message.preamble = None
-
-
-			if get_bool_from_cfg('default', 'add_header', 'yes'):
-				decrypted_message['X-GPG-Mailgate'] = 'Decrypted by GPG Mailgate'
-
-	# If decryption fails, decrypted_message is equal to the original message
-	return decrypted_message
-
-def decrypt_inline_with_attachments( payloads, success, message = None ):
-
-	if message is None:
-		message = email.mime.multipart.MIMEMultipart(payloads.get_content_subtype())
-
-	for payload in payloads.get_payload():
-		if( type( payload.get_payload() ) == list ):
-			# Take care of cascaded MIME messages
-			submessage, subsuccess = decrypt_inline_with_attachments( payload, success )
-			message.attach(submessage)
-			success = success or subsuccess
-		else:
-			msg_content = payload.get_payload()
-
-			# Getting values for different implementations as PGP/INLINE is not implemented
-			# the same on different clients
-			pgp_inline_tags = "-----BEGIN PGP MESSAGE-----" in msg_content and "-----END PGP MESSAGE-----" in msg_content
-			attachment_filename = payload.get_filename()
-
-			if pgp_inline_tags or not (attachment_filename is None) and not (re.search('.\.pgp$', attachment_filename) is None):
-				if pgp_inline_tags:
-					start = msg_content.find("-----BEGIN PGP MESSAGE-----")
-					end = msg_content.find("-----END PGP MESSAGE-----")
-					decrypted_payload, decrypt_success = decrypt_payload(msg_content[start:end + 25])
-				# Some implementations like Enigmail have strange interpretations of PGP/INLINE
-				# This tries to cope with it as good as possible.
-				else:
-					build_message = """
------BEGIN PGP MESSAGE-----
-
-%s
------END PGP MESSAGE-----""" % msg_content
-
-					decrypted_payload, decrypt_success = decrypt_payload(build_message)
-
-				# Was at least one decryption successful?
-				success = success or decrypt_success
-
-				if decrypt_success:
-
-					if not (attachment_filename is None):
-						attachment_filename = re.sub('\.pgp$', '', attachment_filename)
-						payload.set_param('filename', attachment_filename, 'Content-Disposition')
-						payload.set_param('name', attachment_filename, 'Content-Type')
-					# Need this nasty hack to avoid double blank lines at beginning of message
-					payload.set_payload(decrypted_payload.as_string()[1:])
-
-					message.attach(payload)
-				else:
-					# Message could not be decrypted, so non-decrypted message is attached
-					message.attach(payload)
-			else:
-				# There was no encrypted payload found, so the original payload is attached
-				message.attach(payload)
-
- 	return message, success
-
-def decrypt_inline_without_attachments( decrypted_message ):
-
-	msg_content = decrypted_message.get_payload()
-	if "-----BEGIN PGP MESSAGE-----" in msg_content and "-----END PGP MESSAGE-----" in msg_content:
-		start = msg_content.find("-----BEGIN PGP MESSAGE-----")
-		end = msg_content.find("-----END PGP MESSAGE-----")
-		decrypted_payload, decrypt_success = decrypt_payload(msg_content[start:end + 25])
-
-		if decrypt_success:
-			# Need this nasty hack to avoid double blank lines at beginning of message
-			decrypted_message.set_payload(decrypted_payload.as_string()[1:])
-
-			if get_bool_from_cfg('default', 'add_header', 'yes'):
-				decrypted_message['X-GPG-Mailgate'] = 'Decrypted by GPG Mailgate'
-
-	# If message was not encrypted, this will just return the original message
-	return decrypted_message
-
-def decrypt_payload( payload ):
-
-	gpg = GnuPG.GPGDecryptor( cfg['gpg']['keyhome'] )
-	gpg.update( payload )
-	decrypted_data, returncode = gpg.decrypt()
-	if verbose:
-		log("Return code from decryption=%d (0 indicates success)." % returncode)
-	if returncode != 0:
-		log("Decrytion failed with return code %d. Decryption aborted." % returncode)
-		return payload, False
-
-	# Decryption always generate a new message
-	decrypted_msg = email.message_from_string(decrypted_data)
-
-	return decrypted_msg, True
 
 def gpg_encrypt( raw_message, recipients ):
 
@@ -388,6 +169,7 @@ def gpg_encrypt( raw_message, recipients ):
 
 	return ungpg_to
 
+
 def encrypt_all_payloads_inline( message, gpg_to_cmdline ):
 
 	# This breaks cascaded MIME messages. Blame PGP/INLINE.
@@ -402,6 +184,7 @@ def encrypt_all_payloads_inline( message, gpg_to_cmdline ):
 			encrypted_payloads.append( encrypt_payload( payload, gpg_to_cmdline ) )
 
 	return encrypted_payloads
+
 
 def encrypt_all_payloads_mime( message, gpg_to_cmdline ):
 
@@ -445,6 +228,7 @@ def encrypt_all_payloads_mime( message, gpg_to_cmdline ):
 
 	return [ submsg1, encrypt_payload(submsg2, gpg_to_cmdline, check_nested) ]
 
+
 def encrypt_payload( payload, gpg_to_cmdline, check_nested = True ):
 
 	raw_payload = payload.get_payload(decode=True)
@@ -478,7 +262,6 @@ def encrypt_payload( payload, gpg_to_cmdline, check_nested = True ):
 		payload.replace_header( 'Content-Transfer-Encoding', "7bit" )
 
 	return payload
-
 
 
 def get_bool_from_cfg( section, key = None, evaluation = None ):
@@ -543,11 +326,6 @@ def sort_recipients( raw_message, from_addr, to_addrs ):
 	for recipient in to_addrs:
 		recipients_left.append(sanitize_case_sense(recipient))
 
-	# Decrypt mails for recipients with known private PGP keys
-	recipients_left = gpg_decrypt(raw_message, recipients_left)
-	if recipients_left == list():
-		return
-
 	# There is no need for nested encryption
 	first_payload = get_first_payload(raw_message)
 	if first_payload.get_content_type() == 'application/pkcs7-mime':
@@ -573,7 +351,6 @@ def sort_recipients( raw_message, from_addr, to_addrs ):
 	recipients_left = gpg_encrypt(raw_message, recipients_left)
 	if recipients_left == list():
 		return
-
 
 	# Send out mail to recipients which are left
 	send_msg(raw_message.as_string(), recipients_left)
