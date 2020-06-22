@@ -35,10 +35,6 @@ import syslog
 import traceback
 
 
-# imports for S/MIME
-from M2Crypto import BIO, Rand, SMIME, X509
-from email.mime.message import MIMEMessage
-
 # Read configuration from /etc/gpg-mailgate.conf
 _cfg = RawConfigParser()
 _cfg.read('/etc/gpg-mailgate.conf')
@@ -166,7 +162,7 @@ def decrypt_mime( decrypted_message ):
 		start = msg_content.find("-----BEGIN PGP MESSAGE-----")
 		end = msg_content.find("-----END PGP MESSAGE-----")
 		decrypted_payload, decrypt_success = decrypt_payload(msg_content[start:end + 25])
-		
+
 		if decrypt_success:
 			# Making decrypted_message a "normal" unencrypted message
 			decrypted_message.del_param('protocol')
@@ -196,7 +192,7 @@ def decrypt_mime( decrypted_message ):
 	return decrypted_message
 
 def decrypt_inline_with_attachments( payloads, success, message = None ):
-	
+
 	if message is None:
 		message = email.mime.multipart.MIMEMultipart(payloads.get_content_subtype())
 
@@ -212,7 +208,7 @@ def decrypt_inline_with_attachments( payloads, success, message = None ):
 			# Getting values for different implementations as PGP/INLINE is not implemented
 			# the same on different clients
 			pgp_inline_tags = "-----BEGIN PGP MESSAGE-----" in msg_content and "-----END PGP MESSAGE-----" in msg_content
-			attachment_filename = payload.get_filename() 
+			attachment_filename = payload.get_filename()
 
 			if pgp_inline_tags or not (attachment_filename is None) and not (re.search('.\.pgp$', attachment_filename) is None):
 				if pgp_inline_tags:
@@ -229,10 +225,10 @@ def decrypt_inline_with_attachments( payloads, success, message = None ):
 -----END PGP MESSAGE-----""" % msg_content
 
 					decrypted_payload, decrypt_success = decrypt_payload(build_message)
-				
+
 				# Was at least one decryption successful?
 				success = success or decrypt_success
-				
+
 				if decrypt_success:
 
 					if not (attachment_filename is None):
@@ -257,7 +253,7 @@ def decrypt_inline_without_attachments( decrypted_message ):
 	msg_content = decrypted_message.get_payload()
 	if "-----BEGIN PGP MESSAGE-----" in msg_content and "-----END PGP MESSAGE-----" in msg_content:
 		start = msg_content.find("-----BEGIN PGP MESSAGE-----")
-		end = msg_content.find("-----END PGP MESSAGE-----") 
+		end = msg_content.find("-----END PGP MESSAGE-----")
 		decrypted_payload, decrypt_success = decrypt_payload(msg_content[start:end + 25])
 
 		if decrypt_success:
@@ -266,7 +262,7 @@ def decrypt_inline_without_attachments( decrypted_message ):
 
 			if get_bool_from_cfg('default', 'add_header', 'yes'):
 				decrypted_message['X-GPG-Mailgate'] = 'Decrypted by GPG Mailgate'
-	
+
 	# If message was not encrypted, this will just return the original message
 	return decrypted_message
 
@@ -329,7 +325,7 @@ def gpg_encrypt( raw_message, recipients ):
 					continue
 				else:
 					log("Key '%s' in encrypt domain keymap not found in keyring for email address '%s'." % (cfg['enc_domain_keymap'][domain], to))
-		
+
 		# At this point no key has been found
 		if verbose:
 			log("Recipient (%s) not in PGP domain list for encrypting." % to)
@@ -483,84 +479,7 @@ def encrypt_payload( payload, gpg_to_cmdline, check_nested = True ):
 
 	return payload
 
-def smime_encrypt( raw_message, recipients ):
-	
-	if not get_bool_from_cfg('smime', 'cert_path'):
-		log("No valid path for S/MIME certs found in config file. S/MIME encryption aborted.")
-		return recipients
 
-	cert_path = cfg['smime']['cert_path']+"/"
-	s = SMIME.SMIME()
-	sk = X509.X509_Stack()
-	smime_to = list()
-	unsmime_to = list()
-
-	for addr in recipients:
-		cert_and_email = get_cert_for_email(addr, cert_path)
-
-		if not (cert_and_email is None):
-			(to_cert, normal_email) = cert_and_email
-			if verbose:
-				log("Found cert " + to_cert + " for " + addr + ": " + normal_email)
-			smime_to.append(addr)
-			x509 = X509.load_cert(to_cert, format=X509.FORMAT_PEM)
-			sk.push(x509)
-		else:
-			unsmime_to.append(addr)
-
-	if smime_to != list():
-		s.set_x509_stack(sk)
-		s.set_cipher(SMIME.Cipher('aes_192_cbc'))
-		p7 = s.encrypt( BIO.MemoryBuffer( raw_message.as_string() ) )
-		# Output p7 in mail-friendly format.
-		out = BIO.MemoryBuffer()
-		out.write('From: ' + from_addr + '\n')
-		out.write('To: ' + raw_message['To'] + '\n')
-		if raw_message['Cc']:
-			out.write('Cc: ' + raw_message['Cc'] + '\n')
-		if raw_message['Bcc']:
-			out.write('Bcc: ' + raw_message['Bcc'] + '\n')
-		if raw_message['Subject']:
-			out.write('Subject: '+ raw_message['Subject'] + '\n')
-
-		if get_bool_from_cfg('default', 'add_header', 'yes'):
-			out.write('X-GPG-Mailgate: Encrypted by GPG Mailgate\n')
-
-		s.write(out, p7)
-
-		if verbose:
-			log("Sending message from " + from_addr + " to " + str(smime_to))
-
-		send_msg(out.read(), smime_to)
-	if unsmime_to != list():
-		if verbose:
-			log("Unable to find valid S/MIME certificates for " + str(unsmime_to))
-
-	return unsmime_to
-
-def get_cert_for_email( to_addr, cert_path ):
-
-	files_in_directory = os.listdir(cert_path)
-	for filename in files_in_directory:
-		file_path = os.path.join(cert_path, filename)
-		if not os.path.isfile(file_path):
-			continue
-
-		if get_bool_from_cfg('default', 'mail_case_insensitive', 'yes'):
-			if filename.lower() == to_addr:
-				return (file_path, to_addr)
-		else:
-			if filename == to_addr:
-				return (file_path, to_addr)
-	# support foo+ignore@bar.com -> foo@bar.com
-	multi_email = re.match('^([^\+]+)\+([^@]+)@(.*)$', to_addr)
-	if multi_email:
-		fixed_up_email = "%s@%s" % (multi_email.group(1), multi_email.group(3))
-		if verbose:
-			log("Multi-email %s converted to %s" % (to_addr, fixed_up_email))
-		return get_cert_for_email(fixed_up_email)
-
-	return None
 
 def get_bool_from_cfg( section, key = None, evaluation = None ):
 
@@ -624,7 +543,7 @@ def sort_recipients( raw_message, from_addr, to_addrs ):
 	for recipient in to_addrs:
 		recipients_left.append(sanitize_case_sense(recipient))
 
-	# Decrypt mails for recipients with known private PGP keys 
+	# Decrypt mails for recipients with known private PGP keys
 	recipients_left = gpg_decrypt(raw_message, recipients_left)
 	if recipients_left == list():
 		return
@@ -655,10 +574,6 @@ def sort_recipients( raw_message, from_addr, to_addrs ):
 	if recipients_left == list():
 		return
 
-	# Encrypt mails for recipients with known S/MIME certificate
-	recipients_left = smime_encrypt(raw_message, recipients_left)
-	if recipients_left == list():
-		return
 
 	# Send out mail to recipients which are left
 	send_msg(raw_message.as_string(), recipients_left)
